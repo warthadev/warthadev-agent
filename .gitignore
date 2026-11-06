@@ -1,0 +1,5 @@
+# /warthadev-agent/.gitignore
+.env
+.venv/
+__pycache__/
+*.pyc
