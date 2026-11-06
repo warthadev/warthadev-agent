@@ -5,6 +5,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class AgentConfig:
     router_base_url: str
+    router_api_key: str
     local_base_url: str
     internal_api_key: str
     default_model: str
@@ -20,6 +21,7 @@ class AgentConfig:
     def from_env(cls):
         return cls(
             router_base_url=os.getenv("AGENT_ROUTER_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/"),
+            router_api_key=os.getenv("AGENT_ROUTER_API_KEY", ""),
             local_base_url=os.getenv("AGENT_LOCAL_BASE_URL", "http://127.0.0.1:11436/v1").rstrip("/"),
             internal_api_key=os.getenv("AGENT_INTERNAL_API_KEY", ""),
             default_model=os.getenv("AGENT_DEFAULT_MODEL", "openrouter/openrouter/free"),

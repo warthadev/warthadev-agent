@@ -67,8 +67,10 @@ class AgentRuntime:
         local = self._is_local_model(selected_model)
         if local and user_email.strip().lower() != self.config.local_allowed_email:
             raise PermissionError("Local agent access is restricted")
-        if not local and not provider_api_key:
-            raise ValueError("Provider API key is required")
+        if not local:
+            provider_api_key = provider_api_key or self.config.router_api_key
+            if not provider_api_key:
+                raise ValueError("Provider API key is required")
         messages = list(history or [])
         messages.append({"role": "user", "content": prompt})
         headers = {"Content-Type": "application/json"}
@@ -77,7 +79,7 @@ class AgentRuntime:
         base_url = self.config.local_base_url if local else self.config.router_base_url
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             for _ in range(self.config.max_tool_calls + 1):
-                payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto"}
+                payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": False}
                 response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
                 if response.status_code >= 400:
                     raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
