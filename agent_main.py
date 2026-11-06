@@ -2,6 +2,7 @@
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException
+import httpx
 from pydantic import BaseModel, Field
 from agent_config import AgentConfig
 from agent_runtime import AgentRuntime
@@ -22,6 +23,21 @@ app = FastAPI(title="WarthaDev Agent Runtime", version="1.0.0", lifespan=lifespa
 @app.get("/health")
 async def health():
     return {"status": "healthy", "router": config.router_base_url, "local_model": config.local_model}
+@app.get("/v1/models")
+async def list_models(x_agent_internal_key: str | None = Header(default=None)):
+    if x_agent_internal_key != config.internal_api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not config.router_api_key:
+        raise HTTPException(status_code=500, detail="Router API key is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=config.request_timeout) as client:
+            response = await client.get(f"{config.router_base_url}/models", headers={"Authorization": f"Bearer {config.router_api_key}"})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Router unavailable") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Router models request failed")
+    return response.json()
+
 @app.post("/v1/agent/run")
 async def run_agent(payload: AgentRequest, x_agent_internal_key: str | None = Header(default=None)):
     if x_agent_internal_key != config.internal_api_key:
