@@ -11,6 +11,7 @@ class AgentConfig:
     default_model: str
     local_model: str
     local_allowed_email: str
+    local_access_all_users: bool
     request_timeout: float
     max_prompt_chars: int
     workspace: str
@@ -27,6 +28,7 @@ class AgentConfig:
             default_model=os.getenv("AGENT_DEFAULT_MODEL", "gemini/gemini-3.6-flash"),
             local_model=os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip("'\""),
             local_allowed_email=os.getenv("AGENT_LOCAL_ALLOWED_EMAIL", "warthadev@gmail.com").strip().lower(),
+            local_access_all_users=os.getenv("AGENT_LOCAL_ACCESS_ALL_USERS", "true").strip().lower() in {"1", "true", "yes", "on"},
             request_timeout=float(os.getenv("AGENT_REQUEST_TIMEOUT", "180")),
             max_prompt_chars=int(os.getenv("AGENT_MAX_PROMPT_CHARS", "24000")),
             workspace=os.getenv("AGENT_WORKSPACE", "/data/workspace"),

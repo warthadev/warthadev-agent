@@ -65,7 +65,7 @@ class AgentRuntime:
             raise ValueError("Prompt is too long")
         selected_model = model or self.config.default_model
         local = self._is_local_model(selected_model)
-        if local and user_email.strip().lower() != self.config.local_allowed_email:
+        if local and not self.config.local_access_all_users and user_email.strip().lower() != self.config.local_allowed_email:
             raise PermissionError("Local agent access is restricted")
         if not local:
             provider_api_key = provider_api_key or self.config.router_api_key
