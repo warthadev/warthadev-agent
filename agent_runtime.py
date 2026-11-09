@@ -80,6 +80,8 @@ class AgentRuntime:
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             for _ in range(self.config.max_tool_calls + 1):
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": False}
+                if local:
+                    payload.update({"think": False, "max_tokens": 128, "num_predict": 128})
                 response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
                 if response.status_code >= 400:
                     raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
