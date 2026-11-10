@@ -58,6 +58,61 @@ class AgentRuntime:
             return f"exit_code={result.returncode}\n{output[:30000]}"
         raise ValueError("Unknown tool")
 
+    def _response_data(self, response: httpx.Response) -> dict[str, Any]:
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/event-stream" not in content_type and not response.text.lstrip().startswith("data:"):
+                raise
+
+        message: dict[str, Any] = {"role": "assistant", "content": ""}
+        tool_calls: dict[int, dict[str, Any]] = {}
+        response_id = None
+        model = None
+        usage: dict[str, Any] = {}
+        finish_reason = None
+
+        for line in response.text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            response_id = chunk.get("id", response_id)
+            model = chunk.get("model", model)
+            usage.update(chunk.get("usage") or {})
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("role"):
+                    message["role"] = delta["role"]
+                if delta.get("content") is not None:
+                    message["content"] += str(delta["content"])
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
+                for call_delta in delta.get("tool_calls") or []:
+                    index = int(call_delta.get("index", 0))
+                    call = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    call["id"] = call_delta.get("id", call["id"])
+                    call["type"] = call_delta.get("type", call["type"])
+                    function = call_delta.get("function") or {}
+                    call["function"]["name"] += str(function.get("name") or "")
+                    call["function"]["arguments"] += str(function.get("arguments") or "")
+
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        return {
+            "id": response_id,
+            "model": model,
+            "choices": [{"message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
+
     async def run(self, prompt: str, model: str | None, provider_api_key: str, user_email: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("Prompt is required")
@@ -79,13 +134,16 @@ class AgentRuntime:
         base_url = self.config.local_base_url if local else self.config.router_base_url
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             for _ in range(self.config.max_tool_calls + 1):
-                payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": False}
+                payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "max_tokens": self.config.max_output_tokens, "tools": self._tool_specs(), "tool_choice": "auto", "stream": True}
                 if local:
                     payload.update({"think": False, "max_tokens": 128, "num_predict": 128})
                 response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+                if response.status_code == 502:
+                    payload["stream"] = False
+                    response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
                 if response.status_code >= 400:
                     raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
-                data = response.json()
+                data = self._response_data(response)
                 message = (data.get("choices") or [{}])[0].get("message") or {}
                 calls = message.get("tool_calls") or []
                 if not calls:
