@@ -5,7 +5,7 @@ from unittest.mock import patch
 import httpx
 
 from agent_config import AgentConfig
-from agent_runtime import AgentRuntime
+from agent_runtime import AgentRuntime, DEFAULT_SYSTEM_INSTRUCTION
 
 
 class FakeClient:
@@ -92,8 +92,15 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.runtime._is_mimo_model("gemini/gemini-3.6-flash"))
         system_message = fake.payloads[0]["messages"][0]
         self.assertEqual(system_message["role"], "system")
-        self.assertIn("directly and honestly", system_message["content"])
-        self.assertIn("provide code only when requested", system_message["content"])
+        self.assertEqual(system_message["content"], DEFAULT_SYSTEM_INSTRUCTION)
+        self.assertEqual(
+            sum(
+                message.get("role") == "system"
+                and message.get("content") == DEFAULT_SYSTEM_INSTRUCTION
+                for message in fake.payloads[0]["messages"]
+            ),
+            1,
+        )
 
     async def test_local_payload_keeps_think_and_token_caps_on_retry(self):
         fake = FakeClient(
@@ -101,7 +108,11 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
             result = await self.runtime.run(
-                "mock-only", "mimo-v2.6:latest", "", "user@example.test"
+                "mock-only",
+                "mimo-v2.6:latest",
+                "",
+                "user@example.test",
+                history=[{"role": "assistant", "content": "preserved-history"}],
             )
 
         self.assertEqual(result["content"], "local-fallback-ok")
@@ -111,7 +122,21 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(payload["think"], False)
             self.assertEqual(payload["max_tokens"], 128)
             self.assertEqual(payload["num_predict"], 128)
-            self.assertEqual(payload["messages"][0]["role"], "user")
+            self.assertEqual(
+                payload["messages"],
+                [
+                    {"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION},
+                    {"role": "assistant", "content": "preserved-history"},
+                    {"role": "user", "content": "mock-only"},
+                ],
+            )
+            self.assertEqual(
+                sum(
+                    message.get("content") == DEFAULT_SYSTEM_INSTRUCTION
+                    for message in payload["messages"]
+                ),
+                1,
+            )
 
     async def test_prefixed_mimo_catalog_id_retries_streaming_through_router(self):
         model_id = "openai-compatible-chat-test/mimo-v2.6:latest"
@@ -128,7 +153,11 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake.payloads), 2)
         self.assertEqual(fake.urls, ["http://router.invalid/v1/chat/completions"] * 2)
         self.assertTrue(all(payload["model"] == model_id for payload in fake.payloads))
-        self.assertTrue(all(payload["messages"] == [{"role": "user", "content": "mock-only"}] for payload in fake.payloads))
+        expected_messages = [
+            {"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION},
+            {"role": "user", "content": "mock-only"},
+        ]
+        self.assertTrue(all(payload["messages"] == expected_messages for payload in fake.payloads))
         self.assertFalse(self.runtime._is_local_model(model_id))
 
     async def test_persistent_502_for_prefixed_mimo_stops_after_one_retry(self):
@@ -178,6 +207,14 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("attempt=2 status=503 elapsed_ms=", log_text)
         self.assertIn("content_type=other", log_text)
         self.assertEqual(len(fake.payloads), 2)
+        self.assertEqual(
+            fake.payloads[0]["messages"],
+            [
+                {"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION},
+                {"role": "assistant", "content": "private-history-text"},
+                {"role": "user", "content": "private-prompt-text"},
+            ],
+        )
         for private_value in (
             "account-specific-catalog",
             "mimo-v2.6:latest",
