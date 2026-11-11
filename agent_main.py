@@ -2,7 +2,7 @@
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 import httpx
 from pydantic import BaseModel, Field
 from agent_config import AgentConfig
@@ -21,27 +21,19 @@ async def lifespan(_: FastAPI):
         raise RuntimeError("AGENT_INTERNAL_API_KEY is required")
     yield
 app = FastAPI(title="WarthaDev Agent Runtime", version="1.0.0", lifespan=lifespan)
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def status_page():
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WarthaDev Agent Runtime</title>
-</head>
-<body>
-  <main>
-    <h1>WarthaDev Agent Runtime Online</h1>
-    <p>Status endpoint: <a href="/health">/health</a></p>
-    <p>Model lists are account-specific and are shown after sign-in.</p>
-  </main>
-</body>
-</html>"""
+    return {"status": "online", "health": "/health"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy", "router": config.router_base_url, "local_model": config.local_model}
+
+@app.head("/")
+@app.head("/health")
+async def status_head():
+    return Response(status_code=200)
+
 @app.get("/v1/models")
 async def list_models(x_agent_internal_key: str | None = Header(default=None)):
     if x_agent_internal_key != config.internal_api_key:
