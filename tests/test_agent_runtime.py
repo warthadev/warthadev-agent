@@ -25,7 +25,10 @@ class FakeClient:
             raise AssertionError(f"Unexpected request URL: {url}")
         self.urls.append(url)
         self.payloads.append(dict(json))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def make_runtime(workspace):
@@ -141,6 +144,98 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(fake.payloads), 2)
         self.assertEqual([payload["stream"] for payload in fake.payloads], [True, True])
+
+    async def test_mimo_attempt_logs_status_and_redacts_request_and_response_data(self):
+        model_id = "account-specific-catalog/mimo-v2.6:latest"
+        fake = FakeClient(
+            [
+                httpx.Response(
+                    502,
+                    text="private-first-error-body",
+                    headers={"content-type": "text/html; charset=utf-8"},
+                ),
+                httpx.Response(
+                    503,
+                    text="private-final-error-body",
+                    headers={"content-type": "application/x-user@example.test"},
+                ),
+            ]
+        )
+        with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
+            with self.assertLogs("agent_runtime", level="INFO") as captured:
+                with self.assertRaisesRegex(RuntimeError, "503"):
+                    await self.runtime.run(
+                        "private-prompt-text",
+                        model_id,
+                        "private-provider-key",
+                        "private-user@example.test",
+                        history=[{"role": "assistant", "content": "private-history-text"}],
+                    )
+
+        log_text = "\n".join(captured.output)
+        self.assertIn("attempt=1 status=502 elapsed_ms=", log_text)
+        self.assertIn("content_type=text/html", log_text)
+        self.assertIn("attempt=2 status=503 elapsed_ms=", log_text)
+        self.assertIn("content_type=other", log_text)
+        self.assertEqual(len(fake.payloads), 2)
+        for private_value in (
+            "account-specific-catalog",
+            "mimo-v2.6:latest",
+            "router.invalid",
+            "private-prompt-text",
+            "private-history-text",
+            "private-provider-key",
+            "private-user@example.test",
+            "private-first-error-body",
+            "private-final-error-body",
+            "user@example.test",
+        ):
+            self.assertNotIn(private_value, log_text)
+
+    async def test_mimo_success_log_includes_status_elapsed_and_content_type(self):
+        fake = FakeClient([ok_response("mimo-ok")])
+        with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
+            with self.assertLogs("agent_runtime", level="INFO") as captured:
+                result = await self.runtime.run(
+                    "mock-only",
+                    "catalog-prefix/mimo-v2.6:latest",
+                    "mock-provider-key",
+                    "user@example.test",
+                )
+
+        self.assertEqual(result["content"], "mimo-ok")
+        self.assertEqual(len(fake.payloads), 1)
+        self.assertRegex(
+            captured.output[0],
+            r"mimo_request_attempt attempt=1 status=200 elapsed_ms=\d+ content_type=application/json",
+        )
+
+    async def test_mimo_transport_log_contains_exception_class_not_message(self):
+        fake = FakeClient([httpx.ConnectError("private-transport-error-message")])
+        with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
+            with self.assertLogs("agent_runtime", level="INFO") as captured:
+                with self.assertRaises(httpx.ConnectError):
+                    await self.runtime.run(
+                        "private-prompt-text",
+                        "catalog-prefix/mimo-v2.6:latest",
+                        "private-provider-key",
+                        "private-user@example.test",
+                    )
+
+        log_text = "\n".join(captured.output)
+        self.assertRegex(
+            log_text,
+            r"attempt=1 status=none elapsed_ms=\d+ content_type=missing transport_exception=ConnectError",
+        )
+        for private_value in (
+            "private-transport-error-message",
+            "private-prompt-text",
+            "private-provider-key",
+            "private-user@example.test",
+            "catalog-prefix",
+            "router.invalid",
+        ):
+            self.assertNotIn(private_value, log_text)
 
     async def test_successful_sse_is_parsed_without_retry(self):
         sse = (

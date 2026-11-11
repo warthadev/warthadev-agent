@@ -1,10 +1,14 @@
 # /warthadev-agent/agent_runtime.py
 import json
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Any
 import httpx
 from agent_config import AgentConfig
+
+logger = logging.getLogger(__name__)
 
 CLOUD_SYSTEM_INSTRUCTION = (
     "Answer the user's request directly and honestly, in the user's language. "
@@ -26,6 +30,55 @@ class AgentRuntime:
         model_id = model.strip().lower()
         local_id = self.config.local_model.strip().lower()
         return bool(local_id) and (model_id == local_id or model_id.endswith(f"/{local_id}"))
+
+    def _safe_content_type(self, response: httpx.Response) -> str:
+        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+        safe_types = {
+            "application/json",
+            "application/problem+json",
+            "application/x-ndjson",
+            "application/octet-stream",
+            "text/event-stream",
+            "text/html",
+            "text/plain",
+        }
+        if not content_type:
+            return "missing"
+        return content_type if content_type in safe_types else "other"
+
+    async def _post_model_request(
+        self,
+        client: httpx.AsyncClient,
+        request_url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        *,
+        is_mimo: bool,
+        attempt_number: int,
+    ) -> httpx.Response:
+        started_at = time.monotonic()
+        try:
+            response = await client.post(request_url, headers=headers, json=payload)
+        except httpx.TransportError as exc:
+            if is_mimo:
+                logger.info(
+                    "mimo_request_attempt attempt=%d status=none elapsed_ms=%d "
+                    "content_type=missing transport_exception=%s",
+                    attempt_number,
+                    int((time.monotonic() - started_at) * 1000),
+                    type(exc).__name__,
+                )
+            raise
+
+        if is_mimo:
+            logger.info(
+                "mimo_request_attempt attempt=%d status=%d elapsed_ms=%d content_type=%s",
+                attempt_number,
+                response.status_code,
+                int((time.monotonic() - started_at) * 1000),
+                self._safe_content_type(response),
+            )
+        return response
 
     def _path(self, value: str) -> Path:
         path = (self.workspace / value).resolve() if not os.path.isabs(value) else Path(value).resolve()
@@ -147,15 +200,33 @@ class AgentRuntime:
             headers["Authorization"] = f"Bearer {provider_api_key}"
         base_url = self.config.local_base_url if local else self.config.router_base_url
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
+            attempt_number = 0
             for _ in range(self.config.max_tool_calls + 1):
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": True}
                 if local:
                     payload.update({"think": False, "max_tokens": 128, "num_predict": 128})
                 request_url = f"{base_url}/chat/completions"
-                response = await client.post(request_url, headers=headers, json=payload)
+                attempt_number += 1
+                is_mimo = self._is_mimo_model(selected_model)
+                response = await self._post_model_request(
+                    client,
+                    request_url,
+                    headers,
+                    payload,
+                    is_mimo=is_mimo,
+                    attempt_number=attempt_number,
+                )
                 if response.status_code == 502:
-                    if self._is_mimo_model(selected_model):
-                        response = await client.post(request_url, headers=headers, json=payload)
+                    if is_mimo:
+                        attempt_number += 1
+                        response = await self._post_model_request(
+                            client,
+                            request_url,
+                            headers,
+                            payload,
+                            is_mimo=True,
+                            attempt_number=attempt_number,
+                        )
                     else:
                         payload["stream"] = False
                         response = await client.post(request_url, headers=headers, json=payload)
