@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 from agent_config import AgentConfig
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 CLOUD_SYSTEM_INSTRUCTION = (
     "Answer the user's request directly and honestly, in the user's language. "

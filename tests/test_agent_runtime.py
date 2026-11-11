@@ -162,7 +162,7 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
-            with self.assertLogs("agent_runtime", level="INFO") as captured:
+            with self.assertLogs("uvicorn.error", level="INFO") as captured:
                 with self.assertRaisesRegex(RuntimeError, "503"):
                     await self.runtime.run(
                         "private-prompt-text",
@@ -195,7 +195,7 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_mimo_success_log_includes_status_elapsed_and_content_type(self):
         fake = FakeClient([ok_response("mimo-ok")])
         with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
-            with self.assertLogs("agent_runtime", level="INFO") as captured:
+            with self.assertLogs("uvicorn.error", level="INFO") as captured:
                 result = await self.runtime.run(
                     "mock-only",
                     "catalog-prefix/mimo-v2.6:latest",
@@ -213,7 +213,7 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_mimo_transport_log_contains_exception_class_not_message(self):
         fake = FakeClient([httpx.ConnectError("private-transport-error-message")])
         with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
-            with self.assertLogs("agent_runtime", level="INFO") as captured:
+            with self.assertLogs("uvicorn.error", level="INFO") as captured:
                 with self.assertRaises(httpx.ConnectError):
                     await self.runtime.run(
                         "private-prompt-text",
