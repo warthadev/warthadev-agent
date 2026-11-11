@@ -12,6 +12,7 @@ class FakeClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.payloads = []
+        self.urls = []
 
     async def __aenter__(self):
         return self
@@ -22,6 +23,7 @@ class FakeClient:
     async def post(self, url, *, headers, json):
         if not url.endswith("/chat/completions"):
             raise AssertionError(f"Unexpected request URL: {url}")
+        self.urls.append(url)
         self.payloads.append(dict(json))
         return self.responses.pop(0)
 
@@ -83,6 +85,12 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["content"], "fallback-ok")
         self.assertEqual([payload["stream"] for payload in fake.payloads], [True, False])
         self.assertEqual(len(fake.payloads), 2)
+        self.assertEqual(fake.urls, ["http://router.invalid/v1/chat/completions"] * 2)
+        self.assertFalse(self.runtime._is_mimo_model("gemini/gemini-3.6-flash"))
+        system_message = fake.payloads[0]["messages"][0]
+        self.assertEqual(system_message["role"], "system")
+        self.assertIn("directly and honestly", system_message["content"])
+        self.assertIn("provide code only when requested", system_message["content"])
 
     async def test_local_payload_keeps_think_and_token_caps_on_retry(self):
         fake = FakeClient(
@@ -94,12 +102,45 @@ class AgentRuntimeRequestTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["content"], "local-fallback-ok")
-        self.assertEqual([payload["stream"] for payload in fake.payloads], [True, False])
+        self.assertEqual([payload["stream"] for payload in fake.payloads], [True, True])
         self.assertEqual(len(fake.payloads), 2)
         for payload in fake.payloads:
             self.assertIs(payload["think"], False)
             self.assertEqual(payload["max_tokens"], 128)
             self.assertEqual(payload["num_predict"], 128)
+            self.assertEqual(payload["messages"][0]["role"], "user")
+
+    async def test_prefixed_mimo_catalog_id_retries_streaming_through_router(self):
+        model_id = "openai-compatible-chat-test/mimo-v2.6:latest"
+        fake = FakeClient(
+            [httpx.Response(502, text="mock gateway"), ok_response("mimo-retry-ok")]
+        )
+        with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
+            result = await self.runtime.run(
+                "mock-only", model_id, "mock-provider-key", "user@example.test"
+            )
+
+        self.assertEqual(result["content"], "mimo-retry-ok")
+        self.assertEqual([payload["stream"] for payload in fake.payloads], [True, True])
+        self.assertEqual(len(fake.payloads), 2)
+        self.assertEqual(fake.urls, ["http://router.invalid/v1/chat/completions"] * 2)
+        self.assertTrue(all(payload["model"] == model_id for payload in fake.payloads))
+        self.assertTrue(all(payload["messages"] == [{"role": "user", "content": "mock-only"}] for payload in fake.payloads))
+        self.assertFalse(self.runtime._is_local_model(model_id))
+
+    async def test_persistent_502_for_prefixed_mimo_stops_after_one_retry(self):
+        model_id = "openai-compatible-chat-test/mimo-v2.6:latest"
+        fake = FakeClient(
+            [httpx.Response(502, text="mock gateway")] * 2 + [ok_response("must-not-be-used")]
+        )
+        with patch("agent_runtime.httpx.AsyncClient", return_value=fake):
+            with self.assertRaisesRegex(RuntimeError, "502"):
+                await self.runtime.run(
+                    "mock-only", model_id, "mock-provider-key", "user@example.test"
+                )
+
+        self.assertEqual(len(fake.payloads), 2)
+        self.assertEqual([payload["stream"] for payload in fake.payloads], [True, True])
 
     async def test_successful_sse_is_parsed_without_retry(self):
         sse = (

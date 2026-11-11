@@ -6,6 +6,13 @@ from typing import Any
 import httpx
 from agent_config import AgentConfig
 
+CLOUD_SYSTEM_INSTRUCTION = (
+    "Answer the user's request directly and honestly, in the user's language. "
+    "Do not invent facts or claim to have used tools or accessed information you did not. "
+    "If a request needs current web information and no web-search tool is available, say so; do not invent results or sources. "
+    "Do not include internal notes or reasoning; provide code only when requested."
+)
+
 class AgentRuntime:
     def __init__(self, config: AgentConfig):
         self.config = config
@@ -14,6 +21,11 @@ class AgentRuntime:
 
     def _is_local_model(self, model: str) -> bool:
         return model.strip().lower() == self.config.local_model.strip().lower()
+
+    def _is_mimo_model(self, model: str) -> bool:
+        model_id = model.strip().lower()
+        local_id = self.config.local_model.strip().lower()
+        return bool(local_id) and (model_id == local_id or model_id.endswith(f"/{local_id}"))
 
     def _path(self, value: str) -> Path:
         path = (self.workspace / value).resolve() if not os.path.isabs(value) else Path(value).resolve()
@@ -127,6 +139,8 @@ class AgentRuntime:
             if not provider_api_key:
                 raise ValueError("Provider API key is required")
         messages = list(history or [])
+        if not self._is_mimo_model(selected_model):
+            messages.insert(0, {"role": "system", "content": CLOUD_SYSTEM_INSTRUCTION})
         messages.append({"role": "user", "content": prompt})
         headers = {"Content-Type": "application/json"}
         if not local:
@@ -137,10 +151,14 @@ class AgentRuntime:
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": True}
                 if local:
                     payload.update({"think": False, "max_tokens": 128, "num_predict": 128})
-                response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+                request_url = f"{base_url}/chat/completions"
+                response = await client.post(request_url, headers=headers, json=payload)
                 if response.status_code == 502:
-                    payload["stream"] = False
-                    response = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+                    if self._is_mimo_model(selected_model):
+                        response = await client.post(request_url, headers=headers, json=payload)
+                    else:
+                        payload["stream"] = False
+                        response = await client.post(request_url, headers=headers, json=payload)
                 if response.status_code >= 400:
                     raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
                 data = self._response_data(response)
