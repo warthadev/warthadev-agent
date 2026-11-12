@@ -224,7 +224,7 @@ class AgentRuntime:
             for _ in range(self.config.max_tool_calls + 1):
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(), "tool_choice": "auto", "stream": True}
                 if local:
-                    payload.update({"think": False, "max_tokens": 128, "num_predict": 128})
+                    payload.update({"think": False})
                 request_url = f"{base_url}/chat/completions"
                 attempt_number += 1
                 is_mimo = self._is_mimo_model(selected_model)
