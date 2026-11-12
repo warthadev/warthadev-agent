@@ -22,6 +22,8 @@ WORKSPACE_ENDPOINTS = {
     "admin/packages/review",
     "models/local",
     "admin/models/local",
+    "owner/list",
+    "owner/read",
 }
 
 
