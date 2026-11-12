@@ -8,6 +8,21 @@ from fastapi.responses import JSONResponse, Response
 ROUTER_MODELS_URL = "http://9router:20128/v1/models"
 ROUTER_CHAT_URL = "http://9router:20128/v1/chat/completions"
 AGENT_RUN_URL = "http://warthadev-agent:8788/v1/agent/run"
+AGENT_BASE_URL = "http://warthadev-agent:8788"
+WORKSPACE_ENDPOINTS = {
+    "list",
+    "read",
+    "write",
+    "move",
+    "delete",
+    "command",
+    "packages",
+    "packages/request",
+    "admin/packages",
+    "admin/packages/review",
+    "models/local",
+    "admin/models/local",
+}
 
 
 @asynccontextmanager
@@ -101,10 +116,15 @@ async def chat_completions(request: Request):
 
 @app.post("/v1/agent/run")
 async def run_agent(request: Request):
+    return await _forward_agent_request(request, "/v1/agent/run")
+
+
+async def _forward_agent_request(request: Request, runtime_path: str):
     headers = {}
-    internal_key = request.headers.get("x-agent-internal-key")
-    if internal_key is not None:
-        headers["X-Agent-Internal-Key"] = internal_key
+    for name in ("x-agent-internal-key", "x-agent-user-uid", "x-agent-user-role", "x-agent-owner-uid"):
+        value = request.headers.get(name)
+        if value is not None:
+            headers[name.title()] = value
     content_type = request.headers.get("content-type")
     if content_type is not None:
         headers["Content-Type"] = content_type
@@ -112,7 +132,7 @@ async def run_agent(request: Request):
     body = await request.body()
     try:
         upstream = await request.app.state.http.post(
-            AGENT_RUN_URL,
+            f"{AGENT_BASE_URL}{runtime_path}",
             headers=headers,
             content=body,
         )
@@ -124,6 +144,18 @@ async def run_agent(request: Request):
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
     )
+
+
+@app.post("/v1/workspace/{operation:path}")
+async def workspace_operation(operation: str, request: Request):
+    if operation not in WORKSPACE_ENDPOINTS:
+        return JSONResponse(status_code=404, content={"detail": "Workspace route not found"})
+    return await _forward_agent_request(request, f"/v1/workspace/{operation}")
+
+
+@app.post("/v1/agent/host-actions/confirm")
+async def confirm_host_action(request: Request):
+    return await _forward_agent_request(request, "/v1/agent/host-actions/confirm")
 
 
 if __name__ == "__main__":

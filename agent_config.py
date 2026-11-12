@@ -14,6 +14,8 @@ class AgentConfig:
     local_access_all_users: bool
     request_timeout: float
     workspace: str
+    workspace_supervisor_url: str
+    workspace_supervisor_key: str
     max_tool_calls: int
     tool_timeout: int
 
@@ -30,6 +32,8 @@ class AgentConfig:
             local_access_all_users=os.getenv("AGENT_LOCAL_ACCESS_ALL_USERS", "true").strip().lower() in {"1", "true", "yes", "on"},
             request_timeout=float(os.getenv("AGENT_REQUEST_TIMEOUT", "180")),
             workspace=os.getenv("AGENT_WORKSPACE", "/data/workspace"),
+            workspace_supervisor_url=os.getenv("WORKSPACE_SUPERVISOR_URL", "http://wartha-workspace-supervisor:8790").rstrip("/"),
+            workspace_supervisor_key=os.getenv("WORKSPACE_SUPERVISOR_INTERNAL_KEY", ""),
             max_tool_calls=int(os.getenv("AGENT_MAX_TOOL_CALLS", "8")),
             tool_timeout=int(os.getenv("AGENT_TOOL_TIMEOUT", "120")),
         )
