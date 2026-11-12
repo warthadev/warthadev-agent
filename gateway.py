@@ -53,6 +53,11 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/v1/models")
 async def models(request: Request):
     headers = {}
