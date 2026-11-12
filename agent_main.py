@@ -233,6 +233,16 @@ async def workspace_admin_local_models(payload: WorkspacePayload, x_agent_intern
     return await _workspace_call("admin_local_models", payload, x_agent_internal_key, x_agent_user_uid, x_agent_user_role, x_agent_owner_uid)
 
 
+@app.post("/v1/workspace/owner/list")
+async def workspace_owner_list(payload: WorkspacePayload, x_agent_internal_key: str | None = Header(default=None), x_agent_user_uid: str | None = Header(default=None), x_agent_user_role: str | None = Header(default=None), x_agent_owner_uid: str | None = Header(default=None)):
+    return await _workspace_call("owner_list", payload, x_agent_internal_key, x_agent_user_uid, x_agent_user_role, x_agent_owner_uid)
+
+
+@app.post("/v1/workspace/owner/read")
+async def workspace_owner_read(payload: WorkspacePayload, x_agent_internal_key: str | None = Header(default=None), x_agent_user_uid: str | None = Header(default=None), x_agent_user_role: str | None = Header(default=None), x_agent_owner_uid: str | None = Header(default=None)):
+    return await _workspace_call("owner_read", payload, x_agent_internal_key, x_agent_user_uid, x_agent_user_role, x_agent_owner_uid)
+
+
 @app.post("/v1/agent/host-actions/confirm")
 async def confirm_host_action(payload: WorkspacePayload, x_agent_internal_key: str | None = Header(default=None), x_agent_user_uid: str | None = Header(default=None), x_agent_user_role: str | None = Header(default=None), x_agent_owner_uid: str | None = Header(default=None)):
     if not _owner_for_request(payload.uid, x_agent_user_role, x_agent_owner_uid):

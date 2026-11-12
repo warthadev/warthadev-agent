@@ -44,6 +44,8 @@ UID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@/+:-]{0,199}$")
 MAX_COMMAND_SECONDS = 120
 MAX_OUTPUT_CHARS = 30_000
+MAX_HOST_TEXT_READ_BYTES = 1024 * 1024
+HOST_PSEUDO_FILESYSTEMS = frozenset({"proc", "sys", "dev"})
 ACTION_TTL_SECONDS = 600
 
 app = FastAPI(
@@ -668,37 +670,105 @@ def _host_path(value: str, *, allow_missing: bool = False) -> Path:
 
 def _list_host(value: str) -> dict[str, Any]:
     target = _host_path(value)
-    if not target.is_dir():
-        raise HTTPException(status_code=404, detail="Host directory not found")
+    directory_fd = _open_host_directory(target)
+    root = _host_root()
+    relative = target.relative_to(root)
+    pseudo_filesystem = relative.parts[0] if relative.parts else ""
     items = []
-    for path in sorted(target.iterdir(), key=lambda item: item.name.casefold())[:2000]:
-        info = path.lstat()
-        items.append({
-            "name": path.name,
-            "path": "/" + path.relative_to(_host_root()).as_posix(),
-            "type": "symlink" if path.is_symlink() else "directory" if path.is_dir() else "file" if path.is_file() else "other",
-            "size": info.st_size,
-            "modified": int(info.st_mtime),
-        })
-    return {"path": value, "entries": items}
+    try:
+        with os.scandir(os.dup(directory_fd)) as entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                mode = info.st_mode
+                if stat.S_ISLNK(mode):
+                    kind = "symlink"
+                elif stat.S_ISDIR(mode):
+                    kind = "directory"
+                elif stat.S_ISREG(mode):
+                    kind = "file"
+                else:
+                    continue
+                if pseudo_filesystem in HOST_PSEUDO_FILESYSTEMS and kind != "directory":
+                    continue
+                if len(items) >= 2000:
+                    break
+                entry_relative = relative / entry.name
+                entry_path = "/" + entry_relative.as_posix()
+                items.append({
+                    "name": entry.name,
+                    "path": entry_path,
+                    "type": kind,
+                    "size": info.st_size,
+                    "modified": int(info.st_mtime),
+                })
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.ELOOP, errno.ENOTDIR}:
+            raise HTTPException(status_code=403, detail="Host directory cannot be listed safely") from exc
+        raise HTTPException(status_code=503, detail="Host directory listing is unavailable") from exc
+    finally:
+        os.close(directory_fd)
+    items.sort(key=lambda item: item["name"].casefold())
+    display_path = "/" if not relative.parts else "/" + relative.as_posix()
+    return {"path": display_path, "entries": items}
 
 
 def _read_host(value: str) -> dict[str, Any]:
     target = _host_path(value)
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="Host file not found")
-    data = target.read_bytes()
+    root = _host_root()
+    relative = target.relative_to(root)
+    if not relative.parts:
+        raise HTTPException(status_code=400, detail="Host root is not a file")
+    if relative.parts[0] in HOST_PSEUDO_FILESYSTEMS:
+        raise HTTPException(status_code=403, detail="Reading host pseudo-filesystem files is disabled")
+    parent_fd = _open_host_directory(target.parent)
+    file_fd: int | None = None
     try:
-        text: str | None = data.decode("utf-8")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        nonblock = getattr(os, "O_NONBLOCK", 0)
+        if not nofollow or not nonblock:
+            raise HTTPException(status_code=503, detail="Safe host file reads are unavailable")
+        flags = os.O_RDONLY | nofollow | nonblock | getattr(os, "O_CLOEXEC", 0)
+        file_fd = os.open(target.name, flags, dir_fd=parent_fd)
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise HTTPException(status_code=415, detail="Only regular text files can be read")
+        if info.st_size > MAX_HOST_TEXT_READ_BYTES:
+            raise HTTPException(status_code=413, detail="Host text file exceeds the 1 MiB read limit")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_HOST_TEXT_READ_BYTES:
+            chunk = os.read(file_fd, min(64 * 1024, MAX_HOST_TEXT_READ_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_HOST_TEXT_READ_BYTES:
+            raise HTTPException(status_code=413, detail="Host text file exceeds the 1 MiB read limit")
+        data = b"".join(chunks)
+        text = data.decode("utf-8")
+        if "\x00" in text:
+            raise HTTPException(status_code=415, detail="Only UTF-8 text files can be read")
     except UnicodeDecodeError:
-        text = None
+        raise HTTPException(status_code=415, detail="Only UTF-8 text files can be read") from None
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise HTTPException(status_code=404, detail="Host file not found") from exc
+        if exc.errno in {errno.EACCES, errno.ELOOP, errno.ENOTDIR}:
+            raise HTTPException(status_code=403, detail="Host file changed or cannot be opened safely") from exc
+        raise HTTPException(status_code=503, detail="Host file cannot be read safely") from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
     return {
-        "path": "/" + target.relative_to(_host_root()).as_posix(),
+        "path": "/" + relative.as_posix(),
         "name": target.name,
-        "mimeType": mimetypes.guess_type(target.name)[0] or "application/octet-stream",
-        "isText": text is not None,
+        "mimeType": mimetypes.guess_type(target.name)[0] or "text/plain",
+        "isText": True,
         "text": text,
-        "dataBase64": base64.b64encode(data).decode("ascii"),
         "size": len(data),
     }
 
