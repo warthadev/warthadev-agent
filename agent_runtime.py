@@ -1,4 +1,6 @@
 # /warthadev-agent/agent_runtime.py
+import base64
+import binascii
 import json
 import logging
 import os
@@ -37,6 +39,10 @@ For technical work, understand the cause and impact, change only what is needed,
 For longer tasks, update the user when there is an important result, a blocker, or a decision they need to make. If something goes wrong, say so plainly and give the most useful next step.
 
 Say the task is complete only when the result is actually done. If any part remains unfinished, explain what still needs to be done."""
+
+
+class VisionUnsupportedError(RuntimeError):
+    """The selected upstream model explicitly rejected image input."""
 
 class AgentRuntime:
     def __init__(self, config: AgentConfig):
@@ -199,11 +205,43 @@ class AgentRuntime:
             "usage": usage,
         }
 
-    async def run(self, prompt: str, model: str | None, provider_api_key: str, user_email: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _validate_images(self, images: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+        if not images:
+            return []
+        validated: list[dict[str, str]] = []
+        for image in images:
+            if not isinstance(image, dict):
+                raise ValueError("Image payload is invalid")
+            mime_type = image.get("mime_type")
+            encoded = image.get("data")
+            if not isinstance(mime_type, str) or not mime_type.strip().lower().startswith("image/"):
+                raise ValueError("Image MIME type is invalid")
+            if not isinstance(encoded, str) or not encoded:
+                raise ValueError("Image data is required")
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("An image payload is not valid base64") from exc
+            if not decoded:
+                raise ValueError("Image data cannot be empty")
+            validated.append({"mime_type": mime_type.strip().lower(), "data": encoded})
+        return validated
+
+    def _is_vision_unsupported_response(self, response: httpx.Response) -> bool:
+        if response.status_code not in {400, 415, 422}:
+            return False
+        message = response.text[:4000].lower()
+        mentions_image_input = any(term in message for term in ("image", "vision", "multimodal", "image_url"))
+        explicitly_rejected = any(term in message for term in (
+            "not support", "unsupported", "not enabled", "text-only", "text only",
+            "invalid content type", "must be a string",
+        ))
+        return mentions_image_input and explicitly_rejected
+
+    async def run(self, prompt: str, model: str | None, provider_api_key: str, user_email: str, history: list[dict[str, Any]] | None = None, images: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("Prompt is required")
-        if len(prompt) > self.config.max_prompt_chars:
-            raise ValueError("Prompt is too long")
+        validated_images = self._validate_images(images)
         selected_model = model or self.config.default_model
         local = self._is_local_model(selected_model)
         if local and not self.config.local_access_all_users and user_email.strip().lower() != self.config.local_allowed_email:
@@ -214,7 +252,14 @@ class AgentRuntime:
                 raise ValueError("Provider API key is required")
         messages = list(history or [])
         messages.insert(0, {"role": "system", "content": DEFAULT_SYSTEM_INSTRUCTION})
-        messages.append({"role": "user", "content": prompt})
+        user_content: str | list[dict[str, Any]] = prompt
+        if validated_images:
+            user_content = [{"type": "text", "text": prompt or "Describe these images"}]
+            user_content.extend({
+                "type": "image_url",
+                "image_url": {"url": f"data:{image['mime_type']};base64,{image['data']}"},
+            } for image in validated_images)
+        messages.append({"role": "user", "content": user_content})
         headers = {"Content-Type": "application/json"}
         if not local:
             headers["Authorization"] = f"Bearer {provider_api_key}"
@@ -251,6 +296,8 @@ class AgentRuntime:
                         payload["stream"] = False
                         response = await client.post(request_url, headers=headers, json=payload)
                 if response.status_code >= 400:
+                    if validated_images and self._is_vision_unsupported_response(response):
+                        raise VisionUnsupportedError("This model does not support image input")
                     raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
                 data = self._response_data(response)
                 message = (data.get("choices") or [{}])[0].get("message") or {}

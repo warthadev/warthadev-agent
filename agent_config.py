@@ -13,7 +13,6 @@ class AgentConfig:
     local_allowed_email: str
     local_access_all_users: bool
     request_timeout: float
-    max_prompt_chars: int
     workspace: str
     max_tool_calls: int
     tool_timeout: int
@@ -30,7 +29,6 @@ class AgentConfig:
             local_allowed_email=os.getenv("AGENT_LOCAL_ALLOWED_EMAIL", "warthadev@gmail.com").strip().lower(),
             local_access_all_users=os.getenv("AGENT_LOCAL_ACCESS_ALL_USERS", "true").strip().lower() in {"1", "true", "yes", "on"},
             request_timeout=float(os.getenv("AGENT_REQUEST_TIMEOUT", "180")),
-            max_prompt_chars=int(os.getenv("AGENT_MAX_PROMPT_CHARS", "24000")),
             workspace=os.getenv("AGENT_WORKSPACE", "/data/workspace"),
             max_tool_calls=int(os.getenv("AGENT_MAX_TOOL_CALLS", "8")),
             tool_timeout=int(os.getenv("AGENT_TOOL_TIMEOUT", "120")),

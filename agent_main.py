@@ -6,15 +6,20 @@ from fastapi.responses import Response
 import httpx
 from pydantic import BaseModel, Field
 from agent_config import AgentConfig
-from agent_runtime import AgentRuntime
+from agent_runtime import AgentRuntime, VisionUnsupportedError
 config = AgentConfig.from_env()
 runtime = AgentRuntime(config)
+class AgentImagePayload(BaseModel):
+    mime_type: str = Field(min_length=1, max_length=32)
+    data: str = Field(min_length=1)
+
 class AgentRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=24000)
+    prompt: str = Field(min_length=1)
     model: str | None = Field(default=None, max_length=200)
     provider_api_key: str = Field(default="", max_length=500)
     user_email: str = Field(min_length=3, max_length=320)
     history: list[dict] = Field(default_factory=list, max_length=40)
+    images: list[AgentImagePayload] = Field(default_factory=list)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     if not config.internal_api_key:
@@ -54,12 +59,14 @@ async def run_agent(payload: AgentRequest, x_agent_internal_key: str | None = He
     if x_agent_internal_key != config.internal_api_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        result = await runtime.run(payload.prompt, payload.model, payload.provider_api_key, payload.user_email, payload.history)
+        result = await runtime.run(payload.prompt, payload.model, payload.provider_api_key, payload.user_email, payload.history, [image.model_dump() for image in payload.images])
         return {"success": True, "result": result}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except VisionUnsupportedError as exc:
+        raise HTTPException(status_code=422, detail={"code": "vision_unsupported", "message": str(exc)}) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 if __name__ == "__main__":
