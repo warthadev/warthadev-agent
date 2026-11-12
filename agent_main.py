@@ -20,6 +20,7 @@ class AgentRequest(BaseModel):
     user_email: str = Field(min_length=3, max_length=320)
     web_search: bool = False
     search_query: str = Field(default="", max_length=500)
+    timezone: str = Field(default="Asia/Jakarta", max_length=64)
     history: list[dict] = Field(default_factory=list, max_length=40)
     images: list[AgentImagePayload] = Field(default_factory=list)
 @asynccontextmanager
@@ -70,6 +71,7 @@ async def run_agent(payload: AgentRequest, x_agent_internal_key: str | None = He
             [image.model_dump() for image in payload.images],
             web_search=payload.web_search,
             search_query=payload.search_query,
+            timezone_name=payload.timezone,
         )
         return {"success": True, "result": result}
     except ValueError as exc:
