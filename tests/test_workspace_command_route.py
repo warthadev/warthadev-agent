@@ -460,6 +460,129 @@ class WorkspaceCommandRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("POST", route.methods)
 
+    async def test_owner_browse_route_maps_non_owner_permission_error_to_403(self):
+        payload = agent_main.WorkspacePayload(uid="regular-user-uid", path="/")
+        with (
+            patch.object(agent_main, "config", SimpleNamespace(internal_api_key="test-internal-key")),
+            patch.object(agent_main.runtime, "workspace_api", new_callable=AsyncMock, side_effect=PermissionError("Owner access required")) as workspace_api,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_main.workspace_owner_list(
+                    payload,
+                    x_agent_internal_key="test-internal-key",
+                    x_agent_user_uid="regular-user-uid",
+                    x_agent_user_role="user",
+                    x_agent_owner_uid="verified-owner-uid",
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "Owner access required")
+        workspace_api.assert_awaited_once()
+
+    async def test_owner_browse_route_maps_supervisor_http_errors(self):
+        class FakeResponse:
+            def __init__(self, status_code, body):
+                self.status_code = status_code
+                self.body = body
+
+            def json(self):
+                return self.body
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *, headers, json):
+                raise AssertionError("AsyncClient.post should be mocked")
+
+        cases = (
+            (403, {"detail": "Owner access required"}, 403, "Owner access required"),
+            (503, {"detail": "Supervisor temporarily unavailable"}, 502, "Supervisor temporarily unavailable"),
+        )
+        config = SimpleNamespace(
+            workspace_supervisor_url="http://supervisor:8790",
+            workspace_supervisor_key="test-supervisor-key",
+            request_timeout=5,
+        )
+
+        for upstream_status, body, expected_status, expected_detail in cases:
+            with self.subTest(upstream_status=upstream_status):
+                runtime = agent_runtime.AgentRuntime(config)
+                payload = agent_main.WorkspacePayload(uid="verified-owner-uid", path="/")
+                with (
+                    patch.object(agent_main, "config", SimpleNamespace(internal_api_key="test-internal-key")),
+                    patch.object(agent_main, "runtime", runtime),
+                    patch.object(agent_runtime.httpx, "AsyncClient", FakeClient),
+                    patch.object(
+                        FakeClient,
+                        "post",
+                        new_callable=AsyncMock,
+                        return_value=FakeResponse(upstream_status, body),
+                    ) as post,
+                ):
+                    with self.assertRaises(HTTPException) as raised:
+                        await agent_main.workspace_owner_list(
+                            payload,
+                            x_agent_internal_key="test-internal-key",
+                            x_agent_user_uid="verified-owner-uid",
+                            x_agent_user_role="owner",
+                            x_agent_owner_uid="verified-owner-uid",
+                        )
+
+                self.assertEqual(raised.exception.status_code, expected_status)
+                self.assertEqual(raised.exception.detail, expected_detail)
+                post.assert_awaited_once()
+
+    async def test_workspace_route_maps_invalid_and_runtime_errors(self):
+        payload = agent_main.WorkspacePayload(uid="verified-owner-uid", path="/")
+        cases = (
+            (ValueError("Invalid host path"), 400),
+            (RuntimeError("Supervisor unavailable"), 502),
+        )
+        with (
+            patch.object(agent_main, "config", SimpleNamespace(internal_api_key="test-internal-key")),
+            patch.object(agent_main.runtime, "workspace_api", new_callable=AsyncMock) as workspace_api,
+        ):
+            for error, status_code in cases:
+                with self.subTest(status_code=status_code):
+                    workspace_api.side_effect = error
+                    with self.assertRaises(HTTPException) as raised:
+                        await agent_main.workspace_owner_list(
+                            payload,
+                            x_agent_internal_key="test-internal-key",
+                            x_agent_user_uid="verified-owner-uid",
+                            x_agent_user_role="owner",
+                            x_agent_owner_uid="verified-owner-uid",
+                        )
+
+                    self.assertEqual(raised.exception.status_code, status_code)
+                    self.assertEqual(raised.exception.detail, str(error))
+
+    async def test_workspace_command_maps_supervisor_permission_error_to_403(self):
+        payload = agent_main.WorkspaceCommandPayload(command="printf safe")
+        with (
+            patch.object(agent_main, "config", SimpleNamespace(internal_api_key="test-internal-key")),
+            patch.object(agent_main.runtime, "workspace_api", new_callable=AsyncMock, side_effect=PermissionError("Owner access required")) as workspace_api,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_main.workspace_command(
+                    payload,
+                    x_agent_internal_key="test-internal-key",
+                    x_agent_user_uid="regular-user-uid",
+                    x_agent_user_role="user",
+                    x_agent_owner_uid="verified-owner-uid",
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.detail, "Owner access required")
+        workspace_api.assert_awaited_once()
+
 
 class WorkspaceSupervisorCommandIdentityTests(unittest.TestCase):
     def test_supervisor_uses_verified_uid_header_and_ignores_body_identity(self):

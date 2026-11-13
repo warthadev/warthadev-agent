@@ -155,13 +155,20 @@ async def _workspace_call(
     _verify_internal(internal_key)
     _verify_user_identity(payload.uid, header_uid)
     body = payload.model_dump(exclude={"uid"}, exclude_none=True)
-    return await runtime.workspace_api(
-        operation,
-        uid=payload.uid,
-        user_role=role or "user",
-        owner_uid=owner_uid or "",
-        payload=body,
-    )
+    try:
+        return await runtime.workspace_api(
+            operation,
+            uid=payload.uid,
+            user_role=role or "user",
+            owner_uid=owner_uid or "",
+            payload=body,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/v1/workspace/list")
@@ -194,13 +201,20 @@ async def workspace_command(payload: WorkspaceCommandPayload, x_agent_internal_k
     _verify_internal(x_agent_internal_key)
     if not x_agent_user_uid:
         raise HTTPException(status_code=403, detail="Verified user identity is required")
-    return await runtime.workspace_api(
-        "command",
-        uid=x_agent_user_uid,
-        user_role=x_agent_user_role or "user",
-        owner_uid=x_agent_owner_uid or "",
-        payload={"command": payload.command},
-    )
+    try:
+        return await runtime.workspace_api(
+            "command",
+            uid=x_agent_user_uid,
+            user_role=x_agent_user_role or "user",
+            owner_uid=x_agent_owner_uid or "",
+            payload={"command": payload.command},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/v1/workspace/packages")
