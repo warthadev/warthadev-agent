@@ -583,6 +583,35 @@ class WorkspaceCommandRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail, "Owner access required")
         workspace_api.assert_awaited_once()
 
+    def test_owner_and_user_receive_separate_file_toolsets(self):
+        owner_tools = {item["function"]["name"] for item in agent_runtime.AgentRuntime._tool_specs(None, True)}
+        user_tools = {item["function"]["name"] for item in agent_runtime.AgentRuntime._tool_specs(None, False)}
+
+        self.assertEqual(
+            owner_tools,
+            {"host_list", "host_read", "host_write", "host_move", "host_delete", "host_run_command"},
+        )
+        self.assertIn("list_files", user_tools)
+        self.assertIn("run_command", user_tools)
+        self.assertNotIn("host_list", user_tools)
+        self.assertNotIn("host_read", user_tools)
+
+    def test_owner_and_user_receive_different_execution_contexts(self):
+        owner_context = agent_runtime._execution_context_instruction(True)
+        user_context = agent_runtime._execution_context_instruction(False)
+
+        self.assertIn("Start from `/`", owner_context)
+        self.assertIn("do not use or create a per-user UID workspace", owner_context)
+        self.assertIn("confirmation action", owner_context)
+        self.assertIn("isolated persistent workspace", user_context)
+        self.assertNotIn("host tools", user_context)
+
+    async def test_owner_cannot_call_per_user_workspace_tools(self):
+        runtime = agent_runtime.AgentRuntime(SimpleNamespace())
+        for name in ("list_files", "read_file", "write_file", "move_file", "delete_file", "run_command", "list_packages", "request_package"):
+            with self.subTest(tool=name), self.assertRaisesRegex(PermissionError, "must use the Sandbox host tools"):
+                await runtime._tool(name, {}, uid="verified-owner-uid", is_owner=True, owner_uid="verified-owner-uid")
+
 
 class WorkspaceSupervisorCommandIdentityTests(unittest.TestCase):
     def test_supervisor_uses_verified_uid_header_and_ignores_body_identity(self):
