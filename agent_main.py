@@ -24,7 +24,6 @@ class AgentRequest(BaseModel):
     prompt: str = Field(min_length=1)
     model: str | None = Field(default=None, max_length=200)
     provider_api_key: str = Field(default="", max_length=500)
-    user_email: str = Field(min_length=3, max_length=320)
     user_uid: str = Field(min_length=1, max_length=128)
     web_search: bool = False
     search_query: str = Field(default="", max_length=500)
@@ -83,7 +82,7 @@ async def status_page():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "router": config.router_base_url, "local_model": config.local_model}
+    return {"status": "healthy", "router": config.router_base_url}
 
 
 @app.head("/")
@@ -123,7 +122,6 @@ async def run_agent(
             payload.prompt,
             payload.model,
             payload.provider_api_key,
-            payload.user_email,
             payload.history,
             [image.model_dump() for image in payload.images],
             web_search=payload.web_search,

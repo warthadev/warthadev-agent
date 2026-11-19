@@ -6,12 +6,8 @@ from dataclasses import dataclass
 class AgentConfig:
     router_base_url: str
     router_api_key: str
-    local_base_url: str
     internal_api_key: str
     default_model: str
-    local_model: str
-    local_allowed_email: str
-    local_access_all_users: bool
     request_timeout: float
     workspace: str
     workspace_supervisor_url: str
@@ -24,12 +20,8 @@ class AgentConfig:
         return cls(
             router_base_url=os.getenv("AGENT_ROUTER_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/"),
             router_api_key=os.getenv("AGENT_ROUTER_API_KEY", ""),
-            local_base_url=os.getenv("AGENT_LOCAL_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/"),
             internal_api_key=os.getenv("AGENT_INTERNAL_API_KEY", ""),
             default_model=os.getenv("AGENT_DEFAULT_MODEL", "gemini/gemini-3.6-flash"),
-            local_model=os.getenv("AGENT_LOCAL_MODEL", "mimo-v2.6:latest").strip("'\""),
-            local_allowed_email=os.getenv("AGENT_LOCAL_ALLOWED_EMAIL", "warthadev@gmail.com").strip().lower(),
-            local_access_all_users=os.getenv("AGENT_LOCAL_ACCESS_ALL_USERS", "true").strip().lower() in {"1", "true", "yes", "on"},
             request_timeout=float(os.getenv("AGENT_REQUEST_TIMEOUT", "180")),
             workspace=os.getenv("AGENT_WORKSPACE", "/data/workspace"),
             workspace_supervisor_url=os.getenv("WORKSPACE_SUPERVISOR_URL", "http://wartha-workspace-supervisor:8790").rstrip("/"),

@@ -2,10 +2,8 @@
 import base64
 import binascii
 import json
-import logging
 import os
 import re
-import time
 from datetime import datetime, timezone as dt_timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -13,7 +11,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from agent_config import AgentConfig
 
-logger = logging.getLogger("uvicorn.error")
 SEARXNG_SEARCH_URL = "http://searxng:8080/search"
 DEFAULT_SYSTEM_INSTRUCTION = """You are a general-purpose AI assistant. Help users achieve their goals across many areas. When a request is clear and can be completed with the available means, do it directly. Do not merely give instructions when you can complete the task. Never claim to have done something you have not done.
 
@@ -123,14 +120,6 @@ class AgentRuntime:
         self.config = config
         # User data is never stored in this shared runtime container.
 
-    def _is_local_model(self, model: str) -> bool:
-        return model.strip().lower() == self.config.local_model.strip().lower()
-
-    def _is_mimo_model(self, model: str) -> bool:
-        model_id = model.strip().lower()
-        local_id = self.config.local_model.strip().lower()
-        return bool(local_id) and (model_id == local_id or model_id.endswith(f"/{local_id}"))
-
     async def workspace_api(
         self,
         operation: str,
@@ -207,66 +196,14 @@ class AgentRuntime:
             raise RuntimeError("Workspace supervisor returned an invalid response")
         return result
 
-    async def _local_models(self, uid: str, user_role: str, owner_uid: str) -> list[str]:
-        fallback = [self.config.local_model.strip()] if self.config.local_model.strip() else []
-        try:
-            result = await self.workspace_api("local_models", uid=uid, user_role=user_role, owner_uid=owner_uid)
-        except (RuntimeError, ValueError, PermissionError):
-            return fallback
-        models = result.get("models", [])
-        if not isinstance(models, list):
-            return fallback
-        valid = [model.strip() for model in models if isinstance(model, str) and model.strip()]
-        return list(dict.fromkeys(fallback + valid))
-
-    def _safe_content_type(self, response: httpx.Response) -> str:
-        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-        safe_types = {
-            "application/json",
-            "application/problem+json",
-            "application/x-ndjson",
-            "application/octet-stream",
-            "text/event-stream",
-            "text/html",
-            "text/plain",
-        }
-        if not content_type:
-            return "missing"
-        return content_type if content_type in safe_types else "other"
-
     async def _post_model_request(
         self,
         client: httpx.AsyncClient,
         request_url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
-        *,
-        is_mimo: bool,
-        attempt_number: int,
     ) -> httpx.Response:
-        started_at = time.monotonic()
-        try:
-            response = await client.post(request_url, headers=headers, json=payload)
-        except httpx.TransportError as exc:
-            if is_mimo:
-                logger.info(
-                    "mimo_request_attempt attempt=%d status=none elapsed_ms=%d "
-                    "content_type=missing transport_exception=%s",
-                    attempt_number,
-                    int((time.monotonic() - started_at) * 1000),
-                    type(exc).__name__,
-                )
-            raise
-
-        if is_mimo:
-            logger.info(
-                "mimo_request_attempt attempt=%d status=%d elapsed_ms=%d content_type=%s",
-                attempt_number,
-                response.status_code,
-                int((time.monotonic() - started_at) * 1000),
-                self._safe_content_type(response),
-            )
-        return response
+        return await client.post(request_url, headers=headers, json=payload)
 
     def _tool_specs(self, is_owner: bool = False) -> list[dict[str, Any]]:
         tools = [] if is_owner else [
@@ -467,27 +404,20 @@ class AgentRuntime:
         ))
         return mentions_image_input and explicitly_rejected
 
-    async def run(self, prompt: str, model: str | None, provider_api_key: str, user_email: str, history: list[dict[str, Any]] | None = None, images: list[dict[str, Any]] | None = None, web_search: bool = False, search_query: str = "", timezone_name: str = "Asia/Jakarta", user_uid: str = "", user_is_owner: bool = False, owner_uid: str = "") -> dict[str, Any]:
+    async def run(self, prompt: str, model: str | None, provider_api_key: str, history: list[dict[str, Any]] | None = None, images: list[dict[str, Any]] | None = None, web_search: bool = False, search_query: str = "", timezone_name: str = "Asia/Jakarta", user_uid: str = "", user_is_owner: bool = False, owner_uid: str = "") -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("Prompt is required")
         validated_images = self._validate_images(images)
         selected_model = model or self.config.default_model
         user_role = "owner" if user_is_owner else "user"
-        local_models = await self._local_models(user_uid, user_role, owner_uid)
-        local = selected_model.strip() in local_models
-        if local and not self.config.local_access_all_users and user_email.strip().lower() != self.config.local_allowed_email:
-            raise PermissionError("Local agent access is restricted")
-        if not local:
-            provider_api_key = provider_api_key or self.config.router_api_key
-            if not provider_api_key:
-                raise ValueError("Provider API key is required")
+        provider_api_key = provider_api_key or self.config.router_api_key
+        if not provider_api_key:
+            raise ValueError("Provider API key is required")
         current_datetime_question = _is_current_datetime_question(prompt)
         messages = [] if current_datetime_question else list(history or [])
         messages.insert(0, {"role": "system", "content": f"{DEFAULT_SYSTEM_INSTRUCTION}\n\n{_execution_context_instruction(user_is_owner)}\n\n{_current_datetime_context(timezone_name)}"})
-        headers = {"Content-Type": "application/json"}
-        if not local:
-            headers["Authorization"] = f"Bearer {provider_api_key}"
-        base_url = self.config.local_base_url if local else self.config.router_base_url
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {provider_api_key}"}
+        base_url = self.config.router_base_url
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             sources: list[dict[str, str]] = []
             search_prompt = prompt
@@ -510,36 +440,18 @@ class AgentRuntime:
                     "image_url": {"url": f"data:{image['mime_type']};base64,{image['data']}"},
                 } for image in validated_images)
             messages.append({"role": "user", "content": user_content})
-            attempt_number = 0
             for _ in range(self.config.max_tool_calls + 1):
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(user_is_owner), "tool_choice": "auto", "stream": True}
-                if local:
-                    payload.update({"think": False})
                 request_url = f"{base_url}/chat/completions"
-                attempt_number += 1
-                is_mimo = self._is_mimo_model(selected_model)
                 response = await self._post_model_request(
                     client,
                     request_url,
                     headers,
                     payload,
-                    is_mimo=is_mimo,
-                    attempt_number=attempt_number,
                 )
                 if response.status_code == 502:
-                    if is_mimo:
-                        attempt_number += 1
-                        response = await self._post_model_request(
-                            client,
-                            request_url,
-                            headers,
-                            payload,
-                            is_mimo=True,
-                            attempt_number=attempt_number,
-                        )
-                    else:
-                        payload["stream"] = False
-                        response = await client.post(request_url, headers=headers, json=payload)
+                    payload["stream"] = False
+                    response = await client.post(request_url, headers=headers, json=payload)
                 if response.status_code >= 400:
                     if validated_images and self._is_vision_unsupported_response(response):
                         raise VisionUnsupportedError("This model does not support image input")
