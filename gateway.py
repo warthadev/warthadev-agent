@@ -1,36 +1,52 @@
-import os
+"""Minimal text-only OpenAI-compatible gateway for 9Router."""
+
 from contextlib import asynccontextmanager
+import os
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-ROUTER_MODELS_URL = "http://9router:20128/v1/models"
-ROUTER_CHAT_URL = "http://9router:20128/v1/chat/completions"
-AGENT_RUN_URL = "http://warthadev-agent:8788/v1/agent/run"
-AGENT_BASE_URL = "http://warthadev-agent:8788"
-WORKSPACE_ENDPOINTS = {
-    "list",
-    "read",
-    "write",
-    "move",
-    "delete",
-    "command",
-    "packages",
-    "packages/request",
-    "admin/packages",
-    "admin/packages/review",
-    "models/local",
-    "admin/models/local",
-    "owner/list",
-    "owner/read",
-}
+
+ROUTER_BASE_URL = os.getenv("ROUTER_BASE_URL", "http://9router:20128/v1").rstrip("/")
+ROUTER_API_KEY = os.getenv("ROUTER_API_KEY", "")
+REQUEST_TIMEOUT = float(os.getenv("ROUTER_REQUEST_TIMEOUT", "180"))
+
+
+class TextMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    content: str
+    name: str | None = None
+
+
+class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=256)
+    messages: list[TextMessage] = Field(min_length=1, max_length=1000)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    n: int | None = Field(default=None, ge=1, le=128)
+    stream: bool | None = None
+    stop: str | list[str] | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    logit_bias: dict[str, float] | None = None
+    user: str | None = None
+    seed: int | None = None
+    response_format: dict[str, Any] | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(
-        timeout=httpx.Timeout(300.0, connect=10.0),
+        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
         follow_redirects=False,
     )
     try:
@@ -40,55 +56,53 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Wartha restricted gateway",
+    title="Wartha text chat gateway",
+    version="1.0.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
 )
-
 app.router.redirect_slashes = False
 
 
+def _authorization(request: Request) -> str | None:
+    """Use the caller's bearer token, falling back to the configured router key."""
+    supplied = request.headers.get("authorization")
+    if supplied:
+        return supplied
+    if ROUTER_API_KEY:
+        return f"Bearer {ROUTER_API_KEY}"
+    return None
+
+
+def _proxy_headers(request: Request) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    authorization = _authorization(request)
+    if authorization:
+        headers["Authorization"] = authorization
+    return headers
+
+
+def _error(detail: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
-@app.head("/health")
-async def health_head():
-    return Response(status_code=200)
-
-
 @app.get("/v1/models")
-async def models(request: Request):
-    headers = {}
-    authorization = request.headers.get("authorization")
-    if authorization is not None:
-        headers["Authorization"] = authorization
-
+async def models(request: Request) -> Response:
     try:
         upstream = await request.app.state.http.get(
-            ROUTER_MODELS_URL,
-            headers=headers,
+            f"{ROUTER_BASE_URL}/models",
+            headers={"Authorization": _authorization(request)} if _authorization(request) else {},
             params=request.query_params,
         )
     except httpx.HTTPError:
-        return JSONResponse(status_code=502, content={"detail": "Model catalog unavailable"})
-
-    if upstream.status_code < 400:
-        try:
-            payload = upstream.json()
-            models = payload.get("data") if isinstance(payload, dict) else None
-            if isinstance(models, list) and not any(
-                isinstance(model, dict) and model.get("id") == "mimo-v2.6:latest"
-                for model in models
-            ):
-                models.append({"id": "mimo-v2.6:latest", "object": "model", "created": 0, "owned_by": "local"})
-                return JSONResponse(content=payload, status_code=upstream.status_code)
-        except ValueError:
-            pass
-
+        return _error("Model catalog unavailable", 502)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
@@ -97,75 +111,41 @@ async def models(request: Request):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    headers = {}
-    for name in ("authorization", "content-type"):
-        value = request.headers.get(name)
-        if value is not None:
-            headers[name.title()] = value
+async def chat_completions(request: Request) -> Response:
+    try:
+        raw = await request.json()
+    except ValueError:
+        return _error("Request body must be valid JSON")
+    if not isinstance(raw, dict):
+        return _error("Request body must be a JSON object")
+    if any(field in raw for field in ("tools", "tool_choice", "functions", "function_call")):
+        return _error("Tools and function calling are not supported")
+    try:
+        payload = ChatCompletionRequest.model_validate(raw)
+    except ValidationError as exc:
+        messages = exc.errors()
+        if any(error.get("loc", ())[0:1] == ("messages",) for error in messages):
+            return _error("Only text messages with roles system, user, or assistant are supported")
+        return _error("Invalid chat completion request")
+    if any(message.role not in {"system", "user", "assistant"} for message in payload.messages):
+        return _error("Tool and other message roles are not supported")
 
-    body = await request.body()
     try:
         upstream = await request.app.state.http.post(
-            ROUTER_CHAT_URL,
-            headers=headers,
-            content=body,
+            f"{ROUTER_BASE_URL}/chat/completions",
+            headers=_proxy_headers(request),
+            json=payload.model_dump(exclude_none=True),
         )
     except httpx.HTTPError:
-        return JSONResponse(status_code=502, content={"detail": "Router chat unavailable"})
-
+        return _error("Router chat unavailable", 502)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
     )
-
-
-@app.post("/v1/agent/run")
-async def run_agent(request: Request):
-    return await _forward_agent_request(request, "/v1/agent/run")
-
-
-async def _forward_agent_request(request: Request, runtime_path: str):
-    headers = {}
-    for name in ("x-agent-internal-key", "x-agent-user-uid", "x-agent-user-role", "x-agent-owner-uid"):
-        value = request.headers.get(name)
-        if value is not None:
-            headers[name.title()] = value
-    content_type = request.headers.get("content-type")
-    if content_type is not None:
-        headers["Content-Type"] = content_type
-
-    body = await request.body()
-    try:
-        upstream = await request.app.state.http.post(
-            f"{AGENT_BASE_URL}{runtime_path}",
-            headers=headers,
-            content=body,
-        )
-    except httpx.HTTPError:
-        return JSONResponse(status_code=502, content={"detail": "Agent runtime unavailable"})
-
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type", "application/json"),
-    )
-
-
-@app.post("/v1/workspace/{operation:path}")
-async def workspace_operation(operation: str, request: Request):
-    if operation not in WORKSPACE_ENDPOINTS:
-        return JSONResponse(status_code=404, content={"detail": "Workspace route not found"})
-    return await _forward_agent_request(request, f"/v1/workspace/{operation}")
-
-
-@app.post("/v1/agent/host-actions/confirm")
-async def confirm_host_action(request: Request):
-    return await _forward_agent_request(request, "/v1/agent/host-actions/confirm")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("gateway:app", host="0.0.0.0", port=int(os.getenv("PORT", "8789")), workers=1)
+    uvicorn.run("gateway:app", host="0.0.0.0", port=int(os.getenv("PORT", "8788")), workers=1)
