@@ -1,9 +1,8 @@
+# /warthadev-agent/Dockerfile
 FROM python:3.12-slim
-
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY gateway.py ./
-
+COPY agent_config.py agent_runtime.py agent_main.py gateway.py ./
 EXPOSE 8788
-CMD ["python", "gateway.py"]
+CMD ["python", "agent_main.py"]
