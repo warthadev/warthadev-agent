@@ -3,9 +3,12 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
+import asyncio
+import json
+
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_config import AgentConfig
@@ -106,6 +109,23 @@ async def list_models(x_agent_internal_key: str | None = Header(default=None)):
     return response.json()
 
 
+async def _run_agent_call(payload: AgentRequest, is_owner: bool, owner_uid: str, emit=None):
+    return await runtime.run(
+        payload.prompt,
+        payload.model,
+        payload.provider_api_key,
+        payload.history,
+        [image.model_dump() for image in payload.images],
+        web_search=payload.web_search,
+        search_query=payload.search_query,
+        timezone_name=payload.timezone,
+        user_uid=payload.user_uid,
+        user_is_owner=is_owner,
+        owner_uid=owner_uid,
+        emit=emit,
+    )
+
+
 @app.post("/v1/agent/run")
 async def run_agent(
     payload: AgentRequest,
@@ -118,19 +138,7 @@ async def run_agent(
     _verify_user_identity(payload.user_uid, x_agent_user_uid)
     is_owner = _owner_for_request(payload.user_uid, x_agent_user_role, x_agent_owner_uid)
     try:
-        result = await runtime.run(
-            payload.prompt,
-            payload.model,
-            payload.provider_api_key,
-            payload.history,
-            [image.model_dump() for image in payload.images],
-            web_search=payload.web_search,
-            search_query=payload.search_query,
-            timezone_name=payload.timezone,
-            user_uid=payload.user_uid,
-            user_is_owner=is_owner,
-            owner_uid=x_agent_owner_uid or "",
-        )
+        result = await _run_agent_call(payload, is_owner, x_agent_owner_uid or "")
         return {"success": True, "result": result}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -167,6 +175,52 @@ async def _workspace_call(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/v1/agent/run/stream")
+async def run_agent_stream(
+    payload: AgentRequest,
+    x_agent_internal_key: str | None = Header(default=None),
+    x_agent_user_uid: str | None = Header(default=None),
+    x_agent_user_role: str | None = Header(default=None),
+    x_agent_owner_uid: str | None = Header(default=None),
+):
+    _verify_internal(x_agent_internal_key)
+    _verify_user_identity(payload.user_uid, x_agent_user_uid)
+    is_owner = _owner_for_request(payload.user_uid, x_agent_user_role, x_agent_owner_uid)
+
+    async def event_stream():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def emit(event: dict) -> None:
+            await queue.put(event)
+
+        async def runner() -> None:
+            try:
+                result = await _run_agent_call(payload, is_owner, x_agent_owner_uid or "", emit=emit)
+                await queue.put({"type": "final", "result": result})
+            except ValueError as exc:
+                await queue.put({"type": "error", "status": 400, "message": str(exc)})
+            except PermissionError as exc:
+                await queue.put({"type": "error", "status": 403, "message": str(exc)})
+            except VisionUnsupportedError as exc:
+                await queue.put({"type": "error", "status": 422, "code": "vision_unsupported", "message": str(exc)})
+            except Exception as exc:
+                await queue.put({"type": "error", "status": 502, "message": str(exc)})
+            await queue.put(None)
+
+        task = asyncio.create_task(runner())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            task.cancel()
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/v1/workspace/list")

@@ -62,7 +62,8 @@ class WorkspaceRequest(BaseModel):
 
 
 class WorkspaceWriteRequest(WorkspaceRequest):
-    content: str
+    content: str = ""
+    content_base64: str | None = None
 
 
 class WorkspaceMoveRequest(BaseModel):
@@ -322,7 +323,7 @@ def _read_workspace_file(uid: str, value: str) -> dict[str, Any]:
     }
 
 
-def _write_workspace_file(uid: str, value: str, content: str) -> dict[str, Any]:
+def _write_workspace_file(uid: str, value: str, content: str, content_base64: str | None = None) -> dict[str, Any]:
     root = _workspace_root(uid)
     relative = _relative_path(value, allow_root=False)
     parent_value = PurePosixPath(*relative.parts[:-1]) if len(relative.parts) > 1 else PurePosixPath(".")
@@ -334,10 +335,20 @@ def _write_workspace_file(uid: str, value: str, content: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="File path is not a regular file")
     fd, temp_name = tempfile.mkstemp(prefix=".wartha-write-", dir=str(parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if content_base64 is not None:
+            try:
+                binary = base64.b64decode(content_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="content_base64 is not valid base64") from exc
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(binary)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
         os.chmod(temp_name, 0o600)
         os.replace(temp_name, target)
     finally:
@@ -1019,7 +1030,7 @@ def workspace_read(payload: WorkspaceRequest, x_workspace_internal_key: str | No
 def workspace_write(payload: WorkspaceWriteRequest, x_workspace_internal_key: str | None = Header(default=None), x_agent_user_uid: str | None = Header(default=None)):
     uid = _trusted_user_uid(x_workspace_internal_key, x_agent_user_uid)
     with _lock(uid):
-        return _write_workspace_file(uid, payload.path, payload.content)
+        return _write_workspace_file(uid, payload.path, payload.content, payload.content_base64)
 
 
 @app.post("/internal/v1/workspace/move")

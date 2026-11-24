@@ -1,6 +1,6 @@
 # warthadev-agent
 
-Runtime agent internal untuk `warthadev-backend`. Service menerima task terautentikasi dari backend, lalu meneruskan request ke endpoint OpenAI-compatible 9Router.
+Runtime agent internal untuk `warthadev-backend`. Service menerima task terautentikasi dari backend, lalu meneruskan request ke endpoint OpenAI-compatible provider (default OpenRouter) dan menyajikan streaming SSE.
 
 ## Jalankan
 
@@ -30,4 +30,4 @@ docker build -t warthadev-agent .
 docker run --env-file .env -p 127.0.0.1:8788:8788 warthadev-agent
 ```
 
-Jalankan 9Router di endpoint `AGENT_ROUTER_BASE_URL`, lalu isi `AGENT_INTERNAL_API_KEY` yang sama di agent dan backend.
+Arahkan `AGENT_ROUTER_BASE_URL` ke endpoint OpenAI-compatible provider, lalu isi `AGENT_INTERNAL_API_KEY` yang sama di agent dan backend.

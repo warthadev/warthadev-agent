@@ -5,8 +5,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-ROUTER_MODELS_URL = "http://9router:20128/v1/models"
-ROUTER_CHAT_URL = "http://9router:20128/v1/chat/completions"
+ROUTER_BASE_URL = os.getenv("AGENT_ROUTER_BASE_URL", "http://127.0.0.1:20128/v1").rstrip("/")
+ROUTER_MODELS_URL = f"{ROUTER_BASE_URL}/models"
+ROUTER_CHAT_URL = f"{ROUTER_BASE_URL}/chat/completions"
 AGENT_RUN_URL = "http://warthadev-agent:8788/v1/agent/run"
 AGENT_BASE_URL = "http://warthadev-agent:8788"
 WORKSPACE_ENDPOINTS = {
@@ -124,6 +125,11 @@ async def chat_completions(request: Request):
 @app.post("/v1/agent/run")
 async def run_agent(request: Request):
     return await _forward_agent_request(request, "/v1/agent/run")
+
+
+@app.post("/v1/agent/run/stream")
+async def run_agent_stream(request: Request):
+    return await _forward_agent_request(request, "/v1/agent/run/stream")
 
 
 async def _forward_agent_request(request: Request, runtime_path: str):

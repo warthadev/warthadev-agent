@@ -1,17 +1,22 @@
 # /warthadev-agent/agent_runtime.py
+import asyncio
 import base64
 import binascii
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone as dt_timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from agent_config import AgentConfig
 
 SEARXNG_SEARCH_URL = "http://searxng:8080/search"
+MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
+INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+WEB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 DEFAULT_SYSTEM_INSTRUCTION = """You are a general-purpose AI assistant. Help users achieve their goals across many areas. When a request is clear and can be completed with the available means, do it directly. Do not merely give instructions when you can complete the task. Never claim to have done something you have not done.
 
 Understand the user's goals, context, limits, decisions, and preferences. Use information already provided and do not ask again for something already answered. Follow additional instructions the user gives for a conversation or project. When a new instruction updates an earlier preference, follow the new one within its stated scope.
@@ -215,6 +220,7 @@ class AgentRuntime:
             {"type": "function", "function": {"name": "run_command", "description": "Run a shell command in a short-lived isolated container with only this user's workspace mounted; no network, host paths, Docker socket, or model installation access.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
             {"type": "function", "function": {"name": "list_packages", "description": "List this user's package availability and requests. Shared image packages cannot be changed here.", "parameters": {"type": "object", "properties": {}, "required": []}}},
             {"type": "function", "function": {"name": "request_package", "description": "Request a package for review. Existing shared-image packages are recorded as available; new packages await the owner image-build workflow and are never installed ad hoc.", "parameters": {"type": "object", "properties": {"package": {"type": "string"}}, "required": ["package"]}}},
+            {"type": "function", "function": {"name": "download_web_file", "description": "Download an image or file from a public http(s) URL on the internet into this user's workspace (downloads/ folder). Images are shown inline in the chat afterwards.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "filename": {"type": "string"}}, "required": ["url"]}}},
         ]
         if is_owner:
             tools.extend([
@@ -224,10 +230,11 @@ class AgentRuntime:
                 {"type": "function", "function": {"name": "host_move", "description": "Owner-only: propose an exact host file move; the UI requires explicit confirmation before execution.", "parameters": {"type": "object", "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}, "required": ["source", "destination"]}}},
                 {"type": "function", "function": {"name": "host_delete", "description": "Owner-only: propose an exact host file or directory deletion; the UI requires explicit confirmation before execution.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "host_run_command", "description": "Owner-only: propose an exact root command in the Sandbox host. It is not executed until the confirmation card is explicitly approved.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+                {"type": "function", "function": {"name": "download_web_file", "description": "Download an image or file from a public http(s) URL on the internet into this user's workspace (downloads/ folder). Images are shown inline in the chat afterwards.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "filename": {"type": "string"}}, "required": ["url"]}}},
             ])
         return tools
 
-    async def _tool(self, name: str, arguments: dict[str, Any], *, uid: str, is_owner: bool, owner_uid: str) -> str:
+    async def _tool(self, name: str, arguments: dict[str, Any], *, uid: str, is_owner: bool, owner_uid: str, attachments: list[dict[str, Any]] | None = None) -> str:
         role = "owner" if is_owner else "user"
         if is_owner and name in {"list_files", "read_file", "write_file", "move_file", "delete_file", "run_command", "list_packages", "request_package"}:
             raise PermissionError("Owner file and command work must use the Sandbox host tools")
@@ -242,7 +249,12 @@ class AgentRuntime:
             return str(result.get("text") or "")[:limit]
         if name == "write_file":
             result = await self.workspace_api("write", uid=uid, user_role=role, owner_uid=owner_uid, payload={"path": arguments["path"], "content": str(arguments["content"])})
-            return f"Wrote {result.get('path')}"
+            saved_path = str(result.get("path") or arguments["path"])
+            if isinstance(attachments, list):
+                attachments.append({"name": saved_path.rsplit("/", 1)[-1], "path": saved_path, "mimeType": "text/plain", "size": len(str(arguments["content"]))})
+            return f"Wrote {saved_path}"
+        if name == "download_web_file":
+            return await self._download_web_file(arguments, uid=uid, user_role=role, owner_uid=owner_uid, attachments=attachments)
         if name == "move_file":
             result = await self.workspace_api("move", uid=uid, user_role=role, owner_uid=owner_uid, payload={"source": arguments["source"], "destination": arguments["destination"]})
             return f"Moved {result.get('source')} to {result.get('destination')}"
@@ -278,6 +290,63 @@ class AgentRuntime:
             raise ToolConfirmationRequired(pending)
         raise PermissionError("Tool is not available for this account")
 
+    async def _download_web_file(self, arguments: dict[str, Any], *, uid: str, user_role: str, owner_uid: str, attachments: list[dict[str, Any]] | None) -> str:
+        url = str(arguments.get("url") or "").strip()
+        if not re.match(r"^https?://[a-z0-9.:-]+", url, flags=re.IGNORECASE):
+            return "Error: download_web_file requires a public http(s) URL"
+        parsed = urlsplit(url)
+        filename = str(arguments.get("filename") or "").strip().replace("/", "-") or os.path.basename(parsed.path) or f"file-{uuid.uuid4().hex[:6]}.bin"
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, headers={"User-Agent": WEB_USER_AGENT}) as client:
+                response = await client.get(url)
+        except httpx.HTTPError as exc:
+            return f"Error: the file could not be downloaded ({type(exc).__name__})"
+        if response.status_code >= 400:
+            return f"Error: the download URL returned HTTP {response.status_code}"
+        data = response.content
+        if not data:
+            return "Error: the downloaded file is empty"
+        if len(data) > MAX_DOWNLOAD_BYTES:
+            return f"Error: the downloaded file exceeds the {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB limit"
+        mime_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower() or "application/octet-stream"
+        encoded = base64.b64encode(data).decode("ascii")
+        target_path = f"downloads/{filename}"
+        result = await self.workspace_api("write", uid=uid, user_role=user_role, owner_uid=owner_uid, payload={"path": target_path, "content_base64": encoded})
+        saved_path = str(result.get("path") or target_path)
+        entry: dict[str, Any] = {"name": filename, "path": saved_path, "mimeType": mime_type, "size": len(data)}
+        if mime_type.startswith("image/") and len(data) <= INLINE_IMAGE_BYTES:
+            entry["dataUrl"] = f"data:{mime_type};base64,{encoded}"
+        if isinstance(attachments, list):
+            attachments.append(entry)
+        return f"Downloaded {url} into workspace file {saved_path} ({mime_type}, {len(data)} bytes). It is saved and shown to the user."
+
+    @staticmethod
+    def _apply_stream_chunk(chunk: dict[str, Any], state: dict[str, Any]) -> str | None:
+        """Apply one SSE chunk to the accumulator state; returns the content delta."""
+        state["response_id"] = chunk.get("id", state["response_id"])
+        state["model"] = chunk.get("model", state["model"])
+        state["usage"].update(chunk.get("usage") or {})
+        delta_text: str | None = None
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("role"):
+                state["message"]["role"] = delta["role"]
+            content_delta = delta.get("content")
+            if content_delta is not None:
+                state["message"]["content"] += str(content_delta)
+                delta_text = str(content_delta)
+            if choice.get("finish_reason") is not None:
+                state["finish_reason"] = choice["finish_reason"]
+            for call_delta in delta.get("tool_calls") or []:
+                index = int(call_delta.get("index", 0))
+                call = state["tool_calls"].setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                call["id"] = call_delta.get("id", call["id"])
+                call["type"] = call_delta.get("type", call["type"])
+                function = call_delta.get("function") or {}
+                call["function"]["name"] += str(function.get("name") or "")
+                call["function"]["arguments"] += str(function.get("arguments") or "")
+        return delta_text
+
     def _response_data(self, response: httpx.Response) -> dict[str, Any]:
         try:
             return response.json()
@@ -286,12 +355,14 @@ class AgentRuntime:
             if "text/event-stream" not in content_type and not response.text.lstrip().startswith("data:"):
                 raise
 
-        message: dict[str, Any] = {"role": "assistant", "content": ""}
-        tool_calls: dict[int, dict[str, Any]] = {}
-        response_id = None
-        model = None
-        usage: dict[str, Any] = {}
-        finish_reason = None
+        state: dict[str, Any] = {
+            "message": {"role": "assistant", "content": ""},
+            "tool_calls": {},
+            "response_id": None,
+            "model": None,
+            "usage": {},
+            "finish_reason": None,
+        }
 
         for line in response.text.splitlines():
             line = line.strip()
@@ -304,33 +375,16 @@ class AgentRuntime:
                 chunk = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            response_id = chunk.get("id", response_id)
-            model = chunk.get("model", model)
-            usage.update(chunk.get("usage") or {})
-            for choice in chunk.get("choices") or []:
-                delta = choice.get("delta") or {}
-                if delta.get("role"):
-                    message["role"] = delta["role"]
-                if delta.get("content") is not None:
-                    message["content"] += str(delta["content"])
-                if choice.get("finish_reason") is not None:
-                    finish_reason = choice["finish_reason"]
-                for call_delta in delta.get("tool_calls") or []:
-                    index = int(call_delta.get("index", 0))
-                    call = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                    call["id"] = call_delta.get("id", call["id"])
-                    call["type"] = call_delta.get("type", call["type"])
-                    function = call_delta.get("function") or {}
-                    call["function"]["name"] += str(function.get("name") or "")
-                    call["function"]["arguments"] += str(function.get("arguments") or "")
+            self._apply_stream_chunk(chunk, state)
 
-        if tool_calls:
-            message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        message = state["message"]
+        if state["tool_calls"]:
+            message["tool_calls"] = [state["tool_calls"][index] for index in sorted(state["tool_calls"])]
         return {
-            "id": response_id,
-            "model": model,
-            "choices": [{"message": message, "finish_reason": finish_reason}],
-            "usage": usage,
+            "id": state["response_id"],
+            "model": state["model"],
+            "choices": [{"message": message, "finish_reason": state["finish_reason"]}],
+            "usage": state["usage"],
         }
 
     def _validate_images(self, images: list[dict[str, Any]] | None) -> list[dict[str, str]]:
@@ -404,7 +458,7 @@ class AgentRuntime:
         ))
         return mentions_image_input and explicitly_rejected
 
-    async def run(self, prompt: str, model: str | None, provider_api_key: str, history: list[dict[str, Any]] | None = None, images: list[dict[str, Any]] | None = None, web_search: bool = False, search_query: str = "", timezone_name: str = "Asia/Jakarta", user_uid: str = "", user_is_owner: bool = False, owner_uid: str = "") -> dict[str, Any]:
+    async def run(self, prompt: str, model: str | None, provider_api_key: str, history: list[dict[str, Any]] | None = None, images: list[dict[str, Any]] | None = None, web_search: bool = False, search_query: str = "", timezone_name: str = "Asia/Jakarta", user_uid: str = "", user_is_owner: bool = False, owner_uid: str = "", emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("Prompt is required")
         validated_images = self._validate_images(images)
@@ -418,6 +472,12 @@ class AgentRuntime:
         messages.insert(0, {"role": "system", "content": f"{DEFAULT_SYSTEM_INSTRUCTION}\n\n{_execution_context_instruction(user_is_owner)}\n\n{_current_datetime_context(timezone_name)}"})
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {provider_api_key}"}
         base_url = self.config.router_base_url
+        attachments: list[dict[str, Any]] = []
+
+        async def _emit(event: dict[str, Any]) -> None:
+            if emit is not None:
+                await emit(event)
+
         async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
             sources: list[dict[str, str]] = []
             search_prompt = prompt
@@ -441,47 +501,138 @@ class AgentRuntime:
                 } for image in validated_images)
             messages.append({"role": "user", "content": user_content})
             for _ in range(self.config.max_tool_calls + 1):
+                await _emit({"type": "status", "status": "thinking"})
                 payload = {"model": selected_model, "messages": messages, "temperature": 0.2, "tools": self._tool_specs(user_is_owner), "tool_choice": "auto", "stream": True}
                 request_url = f"{base_url}/chat/completions"
-                response = await self._post_model_request(
-                    client,
-                    request_url,
-                    headers,
-                    payload,
-                )
-                if response.status_code == 502:
-                    payload["stream"] = False
-                    response = await client.post(request_url, headers=headers, json=payload)
-                if response.status_code >= 400:
-                    if validated_images and self._is_vision_unsupported_response(response):
-                        raise VisionUnsupportedError("This model does not support image input")
-                    raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
-                data = self._response_data(response)
-                message = (data.get("choices") or [{}])[0].get("message") or {}
+                state: dict[str, Any] = {
+                    "message": {"role": "assistant", "content": ""},
+                    "tool_calls": {},
+                    "response_id": None,
+                    "model": None,
+                    "usage": {},
+                    "finish_reason": None,
+                }
+                if emit is not None:
+                    try:
+                        async with client.stream("POST", request_url, headers=headers, json=payload) as stream_response:
+                            if stream_response.status_code == 502:
+                                payload["stream"] = False
+                                plain = await client.post(request_url, headers=headers, json=payload)
+                                if plain.status_code >= 400:
+                                    raise httpx.HTTPError(f"upstream {plain.status_code}")
+                                self._apply_stream_chunk(plain.json(), state)
+                            elif stream_response.status_code >= 400:
+                                body_text = (await stream_response.aread()).decode("utf-8", errors="ignore")[:500]
+                                if validated_images and self._is_vision_unsupported_response_text(stream_response.status_code, body_text):
+                                    raise VisionUnsupportedError("This model does not support image input")
+                                raise RuntimeError(f"Model request failed: {stream_response.status_code} {body_text}")
+                            else:
+                                async for line in stream_response.aiter_lines():
+                                    line = line.strip()
+                                    if not line.startswith("data:"):
+                                        continue
+                                    raw = line[5:].strip()
+                                    if not raw or raw == "[DONE]":
+                                        continue
+                                    try:
+                                        chunk = json.loads(raw)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    delta_text = self._apply_stream_chunk(chunk, state)
+                                    if delta_text:
+                                        await _emit({"type": "token", "delta": delta_text})
+                    except httpx.HTTPError:
+                        payload["stream"] = False
+                        plain = await client.post(request_url, headers=headers, json=payload)
+                        if plain.status_code >= 400:
+                            if validated_images and self._is_vision_unsupported_response(plain):
+                                raise VisionUnsupportedError("This model does not support image input")
+                            raise RuntimeError(f"Model request failed: {plain.status_code} {plain.text[:500]}")
+                        self._apply_stream_chunk(plain.json(), state)
+                else:
+                    response = await self._post_model_request(client, request_url, headers, payload)
+                    if response.status_code == 502:
+                        payload["stream"] = False
+                        response = await client.post(request_url, headers=headers, json=payload)
+                    if response.status_code >= 400:
+                        if validated_images and self._is_vision_unsupported_response(response):
+                            raise VisionUnsupportedError("This model does not support image input")
+                        raise RuntimeError(f"Model request failed: {response.status_code} {response.text[:500]}")
+                    self._response_data_into(response, state)
+                message = state["message"]
                 calls = message.get("tool_calls") or []
                 if not calls:
-                    return {"id": data.get("id"), "model": data.get("model"), "content": message.get("content", ""), "usage": data.get("usage") or {}, "sources": [{"title": source["title"], "url": source["url"]} for source in sources]}
+                    await _emit({"type": "status", "status": "done"})
+                    return {
+                        "id": state["response_id"],
+                        "model": state["model"],
+                        "content": message.get("content", ""),
+                        "usage": state["usage"] or {},
+                        "sources": [{"title": source["title"], "url": source["url"]} for source in sources],
+                        "attachments": attachments,
+                    }
                 messages.append(message)
                 for call in calls:
+                    tool_name = call.get("function", {}).get("name", "")
                     try:
                         args = json.loads(call.get("function", {}).get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    await _emit({"type": "tool_call", "name": tool_name, "arguments": args})
+                    try:
                         result = await self._tool(
-                            call.get("function", {}).get("name", ""),
+                            tool_name,
                             args,
                             uid=user_uid,
                             is_owner=user_is_owner,
                             owner_uid=owner_uid,
+                            attachments=attachments,
                         )
                     except ToolConfirmationRequired as pending:
                         return {
-                            "id": data.get("id"),
-                            "model": data.get("model") or selected_model,
+                            "id": state["response_id"],
+                            "model": state["model"] or selected_model,
                             "content": "",
-                            "usage": data.get("usage") or {},
+                            "usage": state["usage"] or {},
                             "sources": [{"title": source["title"], "url": source["url"]} for source in sources],
+                            "attachments": attachments,
                             "confirmation_required": pending.payload,
                         }
                     except Exception as exc:
                         result = f"Tool error: {exc}"
-                    messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "name": call.get("function", {}).get("name", ""), "content": result})
+                    await _emit({"type": "tool_result", "name": tool_name, "ok": not str(result).startswith("Tool error") and not str(result).startswith("Error")})
+                    messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "name": tool_name, "content": result})
         raise RuntimeError("Tool call limit reached")
+
+    @staticmethod
+    def _is_vision_unsupported_response_text(status_code: int, body_text: str) -> bool:
+        if status_code not in {400, 415, 422}:
+            return False
+        message = body_text[:4000].lower()
+        mentions_image_input = any(term in message for term in ("image", "vision", "multimodal", "image_url"))
+        explicitly_rejected = any(term in message for term in (
+            "not support", "unsupported", "not enabled", "text-only", "text only",
+            "invalid content type", "must be a string",
+        ))
+        return mentions_image_input and explicitly_rejected
+
+    def _response_data_into(self, response: httpx.Response, state: dict[str, Any]) -> None:
+        try:
+            self._apply_stream_chunk(response.json(), state)
+            return
+        except (json.JSONDecodeError, ValueError):
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/event-stream" not in content_type and not response.text.lstrip().startswith("data:"):
+                raise
+        for line in response.text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self._apply_stream_chunk(chunk, state)
